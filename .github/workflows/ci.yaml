@@ -34,8 +34,8 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: gha-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
-          - name: Who am I?
-            run: aws sts get-caller-identity
+      - name: Who am I?
+        run: aws sts get-caller-identity
 
       # -------- Docker Hub login --------
       - name: Login to Docker Hub

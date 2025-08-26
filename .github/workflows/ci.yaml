@@ -1,57 +1,86 @@
-name: CI Pipeline
+name: CD to EKS (Serve)
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    paths:
+      - "W5-D3-CICD-EKS/**"
+      - ".github/workflows/cd-eks.yml"
+  workflow_dispatch: {}
 
 jobs:
-  build-and-test:
+  build-push-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      # Set this to docker hub repo, e.g. docker.io/samarthbagalkoti/fastapi-serve
+      REGISTRY_REPO: ${{ vars.REGISTRY_REPO }}
+      GIT_SHA: ${{ github.sha }}
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.12"
+      # Still needed to talk to EKS (for kubectl)
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Install dependencies
-      run: |
-        cd W5-D2-CICD-Docker
-        pip install -r requirements.txt
+      # -------- Docker Hub login --------
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
-    - name: Run training
-      run: |
-        cd W5-D2-CICD-Docker
-        python train.py
+      # -------- Build & Push image to Docker Hub --------
+      - name: Build image
+        run: |
+          docker build -f W5-D3-CICD-EKS/serve/Dockerfile.serve -t $REGISTRY_REPO:$GIT_SHA W5-D3-CICD-EKS/serve
+          docker tag $REGISTRY_REPO:$GIT_SHA $REGISTRY_REPO:latest
 
-    - name: Run tests
-      run: |
-        cd W5-D2-CICD-Docker
-        pytest -v
+      - name: Push image
+        run: |
+          docker push $REGISTRY_REPO:$GIT_SHA
+          docker push $REGISTRY_REPO:latest
 
-    # ----------- NEW STEPS -----------
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v2
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+      # -------- Connect to EKS --------
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
 
-    - name: Build Docker image
-      run: |
-        cd W5-D2-CICD-Docker
-        IMAGE=samarthbagalkoti/mlops-w5-d2
-        TAG=${{ github.sha }}
-        docker build -t $IMAGE:$TAG -t $IMAGE:v1 .
+      # -------- Render & Apply K8s manifests --------
+      - name: Install envsubst
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
 
-    - name: Push Docker image
-      run: |
-        cd W5-D2-CICD-Docker
-        IMAGE=samarthbagalkoti/mlops-w5-d2
-        TAG=${{ github.sha }}
-        docker push $IMAGE:$TAG
-        docker push $IMAGE:v1
+      - name: Render manifests
+        env:
+          IMAGE: ${{ env.REGISTRY_REPO }}:${{ env.GIT_SHA }}
+        run: |
+          mkdir -p out
+          IMAGE=$IMAGE K8S_NAMESPACE=$K8S_NAMESPACE envsubst < W5-D3-CICD-EKS/k8s/namespace.yaml > out/namespace.yaml
+          IMAGE=$IMAGE K8S_NAMESPACE=$K8S_NAMESPACE envsubst < W5-D3-CICD-EKS/k8s/deployment.yaml.tpl > out/deployment.yaml
+          IMAGE=$IMAGE K8S_NAMESPACE=$K8S_NAMESPACE envsubst < W5-D3-CICD-EKS/k8s/service.yaml > out/service.yaml
+          IMAGE=$IMAGE K8S_NAMESPACE=$K8S_NAMESPACE envsubst < W5-D3-CICD-EKS/k8s/hpa.yaml > out/hpa.yaml
+          echo "Rendered manifests:"
+          ls -la out
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -f out/namespace.yaml || true
+          kubectl apply -f out/deployment.yaml
+          kubectl apply -f out/service.yaml
+          kubectl apply -f out/hpa.yaml
+
+      - name: Rollout status
+        run: |
+          kubectl -n $K8S_NAMESPACE rollout status deploy/fastapi-serve --timeout=120s
+          kubectl -n $K8S_NAMESPACE get svc fastapi-serve-svc -o wide

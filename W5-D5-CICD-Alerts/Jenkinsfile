@@ -7,13 +7,14 @@ pipeline {
   }
 
   environment {
-    REGISTRY      = "samarthbagalkoti"      // Docker Hub username/namespace
+    REGISTRY      = "samarthbagalkoti"         // Docker Hub namespace
     IMAGE_NAME    = "mlops-w5-serve"
-    AWS_REGION    = "us-east-1"             // EKS region
-    EKS_CLUSTER   = "mlops-eks"             // EKS cluster name
+    AWS_REGION    = "us-east-1"                // EKS region
+    EKS_CLUSTER   = "mlops-eks"                // EKS cluster name
     K8S_NAMESPACE = "mlops-w5"
-    EMAIL_TO      = "samarth.bagalkoti96@gmail.com"  // change if needed
-    // TAG + IMAGE computed in Init Vars
+    EMAIL_TO      = "samarth.bagalkoti96@gmail.com"  // ✅ recipient
+    EMAIL_FROM    = "your-gmail@gmail.com"           // optional: set if your SMTP requires it
+    // TAG + IMAGE computed in "Init Vars"
   }
 
   stages {
@@ -21,7 +22,7 @@ pipeline {
     stage('Checkout') {
       steps {
         deleteDir()
-        checkout scm   // Job SCM should point to your repo; Script Path = W5-D5-CICD-Alerts/Jenkinsfile
+        checkout scm   // Script Path -> W5-D5-CICD-Alerts/Jenkinsfile
       }
     }
 
@@ -43,7 +44,7 @@ pipeline {
           command -v kubectl  >/dev/null 2>&1 || (curl -sL https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl)
           command -v aws      >/dev/null 2>&1 || (curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" && unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install)
           command -v envsubst >/dev/null 2>&1 || (apt-get update && apt-get install -y gettext-base)
-          command -v docker   >/dev/null 2>&1 || (apt-get update && apt-get install -y docker.io || true)
+          command -v docker   >/dev/null 2>&1 || (apt-get update && install -y docker.io || true)
           docker version >/dev/null
         '''
       }
@@ -96,7 +97,7 @@ pipeline {
               env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || \
               env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl create ns "$K8S_NAMESPACE"
 
-              # Template ALL manifests so ${K8S_NAMESPACE} is resolved
+              # Template ALL manifests (namespace vars resolved)
               IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
               IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/service.yaml        > out-svc.yaml
               IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/hpa.yaml            > out-hpa.yaml || true
@@ -117,33 +118,8 @@ pipeline {
   }
 
   post {
-    success {
-      emailext(
-        to: "${env.EMAIL_TO}",
-        subject: "✅ Jenkins Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-        body: """Hello Team,<br/>
-                 The Jenkins pipeline <b>${env.JOB_NAME}</b> <span style='color:green;'>SUCCEEDED</span>.<br/>
-                 Build: #${env.BUILD_NUMBER}<br/>
-                 Image: ${env.IMAGE}<br/>
-                 Cluster: ${env.EKS_CLUSTER} (${env.AWS_REGION})<br/>
-                 <a href='${env.BUILD_URL}'>View build</a>""",
-        mimeType: 'text/html'
-      )
-    }
-    failure {
-      emailext(
-        to: "${env.EMAIL_TO}",
-        subject: "❌ Jenkins FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-        body: """Hello Team,<br/>
-                 The Jenkins pipeline <b>${env.JOB_NAME}</b> <span style='color:red;'>FAILED</span>.<br/>
-                 Build: #${env.BUILD_NUMBER}<br/>
-                 Cluster: ${env.EKS_CLUSTER} (${env.AWS_REGION})<br/>
-                 <a href='${env.BUILD_URL}'>Check console logs</a>""",
-        mimeType: 'text/html'
-      )
-    }
     always {
-      // Re-enter AWS creds so kubectl can auth during post
+      // Ensure kubectl has a fresh token, then show status
       withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
         sh '''
           set -eux
@@ -151,6 +127,33 @@ pipeline {
           aws eks --region "$AWS_REGION" update-kubeconfig --name "$EKS_CLUSTER" || true
           env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" get deploy,po,svc || true
         '''
+      }
+
+      // Single Gmail email on every run (SUCCESS or FAILURE)
+      script {
+        def status = currentBuild.currentResult ?: 'SUCCESS'
+        def emoji  = (status == 'SUCCESS') ? '✅' : '❌'
+        def color  = (status == 'SUCCESS') ? 'green' : 'red'
+        emailext(
+          to: "${env.EMAIL_TO}",
+          from: "${env.EMAIL_FROM}",
+          subject: "${emoji} Jenkins ${status}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+          mimeType: 'text/html',
+          body: """
+            <div style="font-family:Arial,Helvetica,sans-serif;">
+              <h3>${emoji} Pipeline ${status}</h3>
+              <ul>
+                <li><b>Job:</b> ${env.JOB_NAME}</li>
+                <li><b>Build #:</b> ${env.BUILD_NUMBER}</li>
+                <li><b>Status:</b> <span style="color:${color};">${status}</span></li>
+                <li><b>Image:</b> ${env.IMAGE}</li>
+                <li><b>Cluster:</b> ${env.EKS_CLUSTER} (${env.AWS_REGION})</li>
+                <li><b>Namespace:</b> ${env.K8S_NAMESPACE}</li>
+              </ul>
+              <p><a href="${env.BUILD_URL}">View build console</a></p>
+            </div>
+          """
+        )
       }
     }
   }

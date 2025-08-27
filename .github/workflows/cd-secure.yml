@@ -1,0 +1,199 @@
+name: Secure CD → Staging → Prod (with approvals + Gmail)
+
+defaults:
+  run:
+    working-directory: W5-D6-SecureCICD/
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "serve/**"
+      - "k8s/**"
+      - "scripts/**"
+      - ".github/workflows/cd-secure.yml"
+  workflow_dispatch: {}
+
+jobs:
+  # 1) Build & push image (runs once)
+  build_and_push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      REGISTRY_REPO: ${{ vars.REGISTRY_REPO }}  # e.g., dockeruser/mlops-w5-serve OR ECR repo URL
+      GIT_SHA: ${{ github.sha }}
+      CONTAINER_REGISTRY: ${{ vars.CONTAINER_REGISTRY }} # dockerhub|ecr
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Docker Hub
+        if: env.CONTAINER_REGISTRY == 'dockerhub'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to Amazon ECR
+        if: env.CONTAINER_REGISTRY == 'ecr'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          docker build -f serve/Dockerfile.serve -t $REGISTRY_REPO:$GIT_SHA serve
+          docker tag $REGISTRY_REPO:$GIT_SHA $REGISTRY_REPO:latest
+
+      - name: Push image
+        run: |
+          docker push $REGISTRY_REPO:$GIT_SHA
+          docker push $REGISTRY_REPO:latest
+
+  # 2) Deploy to STAGING environment (auto)
+  deploy_staging:
+    needs: [build_and_push]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_STAGING }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE_STAGING }}
+      REGISTRY_REPO: ${{ vars.REGISTRY_REPO }}
+      GIT_SHA: ${{ github.sha }}
+      GMAIL_TO: ${{ vars.GMAIL_TO }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Deploy to STAGING
+        env:
+          IMAGE: ${{ env.REGISTRY_REPO }}:${{ env.GIT_SHA }}
+        run: ./scripts/deploy.sh "$IMAGE" "$K8S_NAMESPACE" "$EKS_CLUSTER_NAME" "$AWS_REGION"
+
+      - name: Notify success (Gmail)
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "✅ STAGING deploy OK: ${{ github.repository }}@${{ github.sha }}"
+          to: ${{ env.GMAIL_TO }}
+          from: CI Bot
+          content_type: text/html
+          body: |
+            <b>STAGING Deployment succeeded</b><br/>
+            Repo: ${{ github.repository }}<br/>
+            Commit: ${{ github.sha }}<br/>
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Notify failure (Gmail)
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "❌ STAGING deploy FAILED: ${{ github.repository }}@${{ github.sha }}"
+          to: ${{ env.GMAIL_TO }}
+          from: CI Bot
+          content_type: text/html
+          body: |
+            <b>STAGING Deployment failed</b><br/>
+            Repo: ${{ github.repository }}<br/>
+            Commit: ${{ github.sha }}<br/>
+            Check logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # 3) Deploy to PROD (manual approval via protected environment)
+  deploy_prod:
+    needs: [deploy_staging]
+    runs-on: ubuntu-latest
+    # Use GitHub Environments → set PROD with "Required reviewers" to enforce manual approval.
+    environment:
+      name: production
+      url: https://your-prod-url.example.com
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_PROD }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE_PROD }}
+      REGISTRY_REPO: ${{ vars.REGISTRY_REPO }}
+      GIT_SHA: ${{ github.sha }}
+      GMAIL_TO: ${{ vars.GMAIL_TO }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Deploy to PROD
+        env:
+          IMAGE: ${{ env.REGISTRY_REPO }}:${{ env.GIT_SHA }}
+        run: ./scripts/deploy.sh "$IMAGE" "$K8S_NAMESPACE" "$EKS_CLUSTER_NAME" "$AWS_REGION"
+
+      - name: Notify success (Gmail)
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "🟢 PROD deploy OK: ${{ github.repository }}@${{ github.sha }}"
+          to: ${{ env.GMAIL_TO }}
+          from: CI Bot
+          content_type: text/html
+          body: |
+            <b>PROD Deployment succeeded</b><br/>
+            Repo: ${{ github.repository }}<br/>
+            Commit: ${{ github.sha }}<br/>
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Notify failure (Gmail)
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "🔴 PROD deploy FAILED: ${{ github.repository }}@${{ github.sha }}"
+          to: ${{ env.GMAIL_TO }}
+          from: CI Bot
+          content_type: text/html
+          body: |
+            <b>PROD Deployment failed</b><br/>
+            Repo: ${{ github.repository }}<br/>
+            Commit: ${{ github.sha }}<br/>
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

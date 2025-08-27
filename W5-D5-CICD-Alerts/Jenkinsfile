@@ -1,0 +1,158 @@
+pipeline {
+  agent any
+
+  options {
+    skipDefaultCheckout(true)
+    timestamps()
+  }
+
+  environment {
+    REGISTRY      = "samarthbagalkoti"      // Docker Hub username/namespace
+    IMAGE_NAME    = "mlops-w5-serve"
+    AWS_REGION    = "us-east-1"             // EKS region
+    EKS_CLUSTER   = "mlops-eks"             // EKS cluster name
+    K8S_NAMESPACE = "mlops-w5"
+    EMAIL_TO      = "samarth.bagalkoti96@gmail.com"  // change if needed
+    // TAG + IMAGE computed in Init Vars
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        deleteDir()
+        checkout scm   // Job SCM should point to your repo; Script Path = W5-D5-CICD-Alerts/Jenkinsfile
+      }
+    }
+
+    stage('Init Vars') {
+      steps {
+        script {
+          env.TAG   = "${env.BUILD_NUMBER}"
+          env.IMAGE = "${env.REGISTRY}/${env.IMAGE_NAME}:${env.TAG}"
+        }
+        echo "IMAGE => ${env.IMAGE}"
+      }
+    }
+
+    stage('Bootstrap Tools') {
+      steps {
+        sh '''
+          set -eux
+          command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y python3 python3-venv python3-pip)
+          command -v kubectl  >/dev/null 2>&1 || (curl -sL https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl)
+          command -v aws      >/dev/null 2>&1 || (curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" && unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install)
+          command -v envsubst >/dev/null 2>&1 || (apt-get update && apt-get install -y gettext-base)
+          command -v docker   >/dev/null 2>&1 || (apt-get update && apt-get install -y docker.io || true)
+          docker version >/dev/null
+        '''
+      }
+    }
+
+    stage('Train & Test') {
+      steps {
+        dir('W5-D5-CICD-Alerts') {
+          sh '''
+            set -eux
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install -U pip
+            pip install -r requirements.txt
+            python train.py
+            pytest -v
+          '''
+        }
+      }
+    }
+
+    stage('Build & Push Docker') {
+      steps {
+        dir('W5-D5-CICD-Alerts') {
+          withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+            sh '''
+              set -eux
+              docker build -f serve/Dockerfile.serve -t "$IMAGE" serve
+              docker tag "$IMAGE" "$REGISTRY/$IMAGE_NAME:latest"
+              echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+              docker push "$IMAGE"
+              docker push "$REGISTRY/$IMAGE_NAME:latest"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          dir('W5-D5-CICD-Alerts') {
+            sh '''
+              set -eux
+              export AWS_DEFAULT_REGION="$AWS_REGION"
+              aws eks --region "$AWS_REGION" update-kubeconfig --name "$EKS_CLUSTER"
+              kubectl config current-context
+
+              # Ensure namespace (avoid proxy envs for kubectl)
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || \
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl create ns "$K8S_NAMESPACE"
+
+              # Template ALL manifests so ${K8S_NAMESPACE} is resolved
+              IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
+              IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/service.yaml        > out-svc.yaml
+              IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/hpa.yaml            > out-hpa.yaml || true
+
+              # Apply to the namespace
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f out-deploy.yaml
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f out-svc.yaml
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f out-hpa.yaml || true
+
+              # Status
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" rollout status deploy/fastapi-serve --timeout=120s || true
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" get deploy,po,svc
+            '''
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      emailext(
+        to: "${env.EMAIL_TO}",
+        subject: "✅ Jenkins Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+        body: """Hello Team,<br/>
+                 The Jenkins pipeline <b>${env.JOB_NAME}</b> <span style='color:green;'>SUCCEEDED</span>.<br/>
+                 Build: #${env.BUILD_NUMBER}<br/>
+                 Image: ${env.IMAGE}<br/>
+                 Cluster: ${env.EKS_CLUSTER} (${env.AWS_REGION})<br/>
+                 <a href='${env.BUILD_URL}'>View build</a>""",
+        mimeType: 'text/html'
+      )
+    }
+    failure {
+      emailext(
+        to: "${env.EMAIL_TO}",
+        subject: "❌ Jenkins FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+        body: """Hello Team,<br/>
+                 The Jenkins pipeline <b>${env.JOB_NAME}</b> <span style='color:red;'>FAILED</span>.<br/>
+                 Build: #${env.BUILD_NUMBER}<br/>
+                 Cluster: ${env.EKS_CLUSTER} (${env.AWS_REGION})<br/>
+                 <a href='${env.BUILD_URL}'>Check console logs</a>""",
+        mimeType: 'text/html'
+      )
+    }
+    always {
+      // Re-enter AWS creds so kubectl can auth during post
+      withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+        sh '''
+          set -eux
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+          aws eks --region "$AWS_REGION" update-kubeconfig --name "$EKS_CLUSTER" || true
+          env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" get deploy,po,svc || true
+        '''
+      }
+    }
+  }
+}
+

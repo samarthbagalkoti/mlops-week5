@@ -12,10 +12,7 @@ pipeline {
     AWS_REGION    = "us-east-1"
     EKS_CLUSTER   = "mlops-eks"
     K8S_NAMESPACE = "mlops-w5"
-
-    // Computed later
-    // TAG
-    // IMAGE
+    // TAG + IMAGE computed in Init Vars
   }
 
   stages {
@@ -23,8 +20,7 @@ pipeline {
     stage('Checkout') {
       steps {
         deleteDir()
-        // Uses the job's SCM (you already set URL=github repo, branch=main, script path=W5-D4-Jenkins/Jenkinsfile)
-        checkout scm
+        checkout scm   // Job SCM: URL=https://github.com/samarthbagalkoti/mlops-week5.git, Branch=main
       }
     }
 
@@ -93,34 +89,38 @@ pipeline {
       }
     }
 
+    // === Your updated stage ===
     stage('Deploy to EKS') {
       steps {
-         withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-      dir('W5-D4-Jenkins') {
-         sh '''
-           set -eux
-           export AWS_DEFAULT_REGION="$AWS_REGION"
-           aws eks --region "$AWS_REGION" update-kubeconfig --name "$EKS_CLUSTER"
+        withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          dir('W5-D4-Jenkins') {
+            sh '''
+              set -eux
+              export AWS_DEFAULT_REGION="$AWS_REGION"
+              aws eks --region "$AWS_REGION" update-kubeconfig --name "$EKS_CLUSTER"
 
-           kubectl config current-context
-           env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || \
-           env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl create ns "$K8S_NAMESPACE"
+              kubectl config current-context
+              # Avoid proxy interference for kubectl
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || \
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl create ns "$K8S_NAMESPACE"
 
-           IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
-           env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f out-deploy.yaml
-           env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f k8s/service.yaml
-           env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f k8s/hpa.yaml || true
-         '''
-       }
-     }
-   }
- }
+              IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f out-deploy.yaml
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f k8s/service.yaml
+              env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" apply -f k8s/hpa.yaml || true
+            '''
+          }
+        }
+      }
+    }
+  }
 
   post {
     always {
-      // Guard kubectl from any proxy env and don't fail the build if it can't reach cluster
-      sh 'env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" get all || true'
+      // Show status, but never fail the build here
+      sh 'env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY kubectl -n "$K8S_NAMESPACE" get deploy,po,svc || true'
     }
   }
 }
+
 

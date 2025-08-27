@@ -13,7 +13,7 @@ pipeline {
     EKS_CLUSTER   = "mlops-eks"                // EKS cluster name
     K8S_NAMESPACE = "mlops-w5"
     EMAIL_TO      = "samarth.bagalkoti96@gmail.com"  // ✅ recipient
-    EMAIL_FROM    = "your-gmail@gmail.com"           // optional: set if your SMTP requires it
+    EMAIL_FROM    = "samarth.bagalkoti@gmail.com"           // optional: set if your SMTP requires it
     // TAG + IMAGE computed in "Init Vars"
   }
 

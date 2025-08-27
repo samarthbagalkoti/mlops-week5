@@ -1,0 +1,76 @@
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY = "your-docker-username"
+        IMAGE_NAME = "mlops-w5-serve"
+        TAG = "${env.BUILD_NUMBER}"
+        IMAGE = "${env.REGISTRY}/${env.IMAGE_NAME}:${env.TAG}"
+        AWS_REGION = "ap-south-1"
+        EKS_CLUSTER = "your-eks-cluster"
+        K8S_NAMESPACE = "mlops-w5"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Setup Python & Run Training') {
+            steps {
+                sh '''
+                  python3 -m venv .venv
+                  source .venv/bin/activate
+                  pip install -r requirements.txt
+                  python train.py
+                  pytest -v
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                  docker build -f serve/Dockerfile.serve -t $IMAGE serve
+                  docker tag $IMAGE $REGISTRY/$IMAGE_NAME:latest
+                '''
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh '''
+                      echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                      docker push $IMAGE
+                      docker push $REGISTRY/$IMAGE_NAME:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                withCredentials([string(credentialsId: 'aws-cli-profile', variable: 'AWS_PROFILE')]) {
+                    sh '''
+                      aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
+                      IMAGE=$IMAGE K8S_NAMESPACE=$K8S_NAMESPACE envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
+                      kubectl apply -f k8s/namespace.yaml || true
+                      kubectl apply -f out-deploy.yaml
+                      kubectl apply -f k8s/service.yaml
+                      kubectl apply -f k8s/hpa.yaml
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'kubectl -n $K8S_NAMESPACE get all || true'
+        }
+    }
+}
+

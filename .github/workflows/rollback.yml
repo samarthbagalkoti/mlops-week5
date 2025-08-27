@@ -1,0 +1,67 @@
+name: Manual Rollback (GitHub Actions → EKS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "staging or production"
+        required: true
+        default: "production"
+      image_tag:
+        description: "Tag to roll back to (e.g., a previous commit SHA)"
+        required: true
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      REGISTRY_REPO: ${{ vars.REGISTRY_REPO }}
+      GMAIL_TO: ${{ vars.GMAIL_TO }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Pick cluster/ns by environment
+        id: pick
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" == "staging" ]]; then
+            echo "cluster=${{ vars.EKS_CLUSTER_STAGING }}" >> $GITHUB_OUTPUT
+            echo "ns=${{ vars.K8S_NAMESPACE_STAGING }}" >> $GITHUB_OUTPUT
+          else
+            echo "cluster=${{ vars.EKS_CLUSTER_PROD }}" >> $GITHUB_OUTPUT
+            echo "ns=${{ vars.K8S_NAMESPACE_PROD }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Execute rollback
+        run: |
+          ./scripts/rollback.sh "$REGISTRY_REPO" "${{ github.event.inputs.image_tag }}" \
+            "${{ steps.pick.outputs.ns }}" "${{ steps.pick.outputs.cluster }}" "${{ env.AWS_REGION }}"
+
+      - name: Notify rollback (Gmail)
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "↩️ Rollback done: ${{ github.event.inputs.environment }} → ${{ github.event.inputs.image_tag }}"
+          to: ${{ env.GMAIL_TO }}
+          from: CI Bot
+          content_type: text/html
+          body: |
+            <b>Rollback completed</b><br/>
+            Env: ${{ github.event.inputs.environment }}<br/>
+            Tag: ${{ github.event.inputs.image_tag }}<br/>
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

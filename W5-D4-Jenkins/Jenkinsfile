@@ -1,76 +1,119 @@
 pipeline {
-    agent any
+  agent any
 
-    environment {
-        REGISTRY = "your-docker-username"
-        IMAGE_NAME = "mlops-w5-serve"
-        TAG = "${env.BUILD_NUMBER}"
-        IMAGE = "${env.REGISTRY}/${env.IMAGE_NAME}:${env.TAG}"
-        AWS_REGION = "ap-south-1"
-        EKS_CLUSTER = "your-eks-cluster"
-        K8S_NAMESPACE = "mlops-w5"
+  options {
+    skipDefaultCheckout(true)   // avoid the extra failing SCM checkout
+    timestamps()
+  }
+
+  environment {
+    REGISTRY      = "samarthbagalkoti"        // Docker Hub username/namespace
+    IMAGE_NAME    = "mlops-w5-serve"
+    AWS_REGION    = "us-east-1"
+    EKS_CLUSTER   = "mlops-eks"
+    K8S_NAMESPACE = "mlops-w5"
+    // If your repo is private over HTTPS, set a Jenkins credential ID here and use that job-wide.
+    // GITHUB_CRED = "github-https"            // (optional) PAT-based "Username/Password" cred
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        deleteDir()
+        // Uses the SCM from the job (lightweight read already happened for the Jenkinsfile)
+        checkout scm
+      }
     }
 
-    stages {
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
+    stage('Init Vars') {
+      steps {
+        script {
+          env.TAG   = "${env.BUILD_NUMBER}"
+          env.IMAGE = "${env.REGISTRY}/${env.IMAGE_NAME}:${env.TAG}"
         }
-
-        stage('Setup Python & Run Training') {
-            steps {
-                sh '''
-                  python3 -m venv .venv
-                  source .venv/bin/activate
-                  pip install -r requirements.txt
-                  python train.py
-                  pytest -v
-                '''
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                sh '''
-                  docker build -f serve/Dockerfile.serve -t $IMAGE serve
-                  docker tag $IMAGE $REGISTRY/$IMAGE_NAME:latest
-                '''
-            }
-        }
-
-        stage('Push Docker Image') {
-            steps {
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-                    sh '''
-                      echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
-                      docker push $IMAGE
-                      docker push $REGISTRY/$IMAGE_NAME:latest
-                    '''
-                }
-            }
-        }
-
-        stage('Deploy to EKS') {
-            steps {
-                withCredentials([string(credentialsId: 'aws-cli-profile', variable: 'AWS_PROFILE')]) {
-                    sh '''
-                      aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
-                      IMAGE=$IMAGE K8S_NAMESPACE=$K8S_NAMESPACE envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
-                      kubectl apply -f k8s/namespace.yaml || true
-                      kubectl apply -f out-deploy.yaml
-                      kubectl apply -f k8s/service.yaml
-                      kubectl apply -f k8s/hpa.yaml
-                    '''
-                }
-            }
-        }
+        echo "IMAGE => ${env.IMAGE}"
+      }
     }
 
-    post {
-        always {
-            sh 'kubectl -n $K8S_NAMESPACE get all || true'
-        }
+    stage('Bootstrap Tools') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          command -v python3 >/dev/null || (apt-get update && apt-get install -y python3 python3-venv python3-pip)
+          command -v kubectl >/dev/null || (curl -sL https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl)
+          command -v aws >/dev/null || (curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" && unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install)
+          command -v envsubst >/dev/null || (apt-get update && apt-get install -y gettext-base)
+          command -v docker >/dev/null || (apt-get update && apt-get install -y docker.io || true)
+          docker version >/dev/null
+        '''
+      }
     }
+
+    stage('Setup Python & Run Training') {
+      steps {
+        dir('W5-D4-Jenkins') {
+          sh '''
+            set -euxo pipefail
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install -U pip
+            pip install -r requirements.txt
+            python train.py
+            pytest -v
+          '''
+        }
+      }
+    }
+
+    stage('Build Docker Image') {
+      steps {
+        dir('W5-D4-Jenkins') {
+          sh '''
+            set -euxo pipefail
+            docker build -f serve/Dockerfile.serve -t "$IMAGE" serve
+            docker tag "$IMAGE" "$REGISTRY/$IMAGE_NAME:latest"
+          '''
+        }
+      }
+    }
+
+    stage('Push Docker Image') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+          sh '''
+            set -euxo pipefail
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+            docker push "$IMAGE"
+            docker push "$REGISTRY/$IMAGE_NAME:latest"
+          '''
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        withCredentials([string(credentialsId: 'aws-cli-profile', variable: 'AWS_PROFILE')]) {
+          dir('W5-D4-Jenkins') {
+            sh '''
+              set -euxo pipefail
+              aws eks --region "$AWS_REGION" --profile "$AWS_PROFILE" update-kubeconfig --name "$EKS_CLUSTER"
+              kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE"
+              IMAGE="$IMAGE" K8S_NAMESPACE="$K8S_NAMESPACE" envsubst < k8s/deployment.yaml.tpl > out-deploy.yaml
+              kubectl -n "$K8S_NAMESPACE" apply -f out-deploy.yaml
+              kubectl -n "$K8S_NAMESPACE" apply -f k8s/service.yaml
+              kubectl -n "$K8S_NAMESPACE" apply -f k8s/hpa.yaml || true
+            '''
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'kubectl -n "$K8S_NAMESPACE" get all || true'
+    }
+  }
 }
 
